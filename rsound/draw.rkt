@@ -11,6 +11,7 @@
                   frame%
                   text%
                   editor-canvas%
+                  horizontal-panel%
                   color%)
          (only-in racket/list
                   empty?
@@ -113,7 +114,52 @@
                      (+ view-start-x i) (num->pixel/right right-min)))))
          #f)])))
 
-
+(define (make-sound-mono-drawing-callback left-getter vec-len common-scale?)
+  (define last-draw-time-box (box (- (current-inexact-milliseconds) MIN-REDRAW-INTERVAL)))
+  (define actual-max (abs-max-from left-getter vec-len))
+  (define display-max (make-nonzero actual-max))
+  (lambda (canvas dc)
+    (cond 
+      #;[(< (- (current-inexact-milliseconds) (unbox last-draw-time-box)) MIN-REDRAW-INTERVAL)
+       #f]
+      [else
+       (set-box! last-draw-time-box (current-inexact-milliseconds))
+       ;; the x position on the virtual canvas:
+       (define-values (view-start-x _1) (send canvas get-view-start))
+       ;; the width in pixels of the area to be drawn:
+       (define-values (client-width _2) (send canvas get-client-size))
+       ;; the total width of the virtual canvas:
+       (define-values (virtual-canvas-width _3) (send canvas get-virtual-size))
+       (define frames-per-pixel (/ vec-len virtual-canvas-width))
+       (define data-left (floor (* frames-per-pixel view-start-x)))
+       (define frames (floor (* frames-per-pixel client-width)))
+       ;; because of canvas resizing or zooming, the window may extend 
+       ;; beyond the edge of the sound. Stop at the last real frame.
+       (define proposed-data-right (+ data-left frames))
+       (define actual-data-right (min vec-len proposed-data-right))
+       (define stop-pixel (- (/ actual-data-right frames-per-pixel) view-start-x))
+       (let* ([h (- (send canvas get-height) 1)]
+              [half-h (floor (/ h 2))]
+              [h-scale (/ (- frames 1) (- client-width 1))]
+              [v-scale-left (/ (/ half-h 2) display-max)]
+              [upper-centerline (* 1/2 half-h)]
+              [lower-centerline (* 3/2 half-h)]
+              [offset-left-getter (lambda (i) (left-getter (+ i data-left)))])
+         ;; basically, this is a rasterization problem.
+         ;; the very left and right edges are special cases.
+         ;; ... in fact, I'll just skip them for now :)
+         (for ([i (in-range 1 (- stop-pixel 1))])
+           (let ([raster-left (* h-scale (- i 1/2))]
+                 [raster-right (* h-scale (+ i 1/2))])
+             (let*-values ([(left-min left-max) 
+                            (rasterize-column offset-left-getter
+                                              raster-left raster-right)])
+               (define (num->pixel/left n)
+                 (inexact->exact (floor (- upper-centerline (* v-scale-left n)))))
+               (send dc draw-line
+                     (+ view-start-x i) (num->pixel/left left-max)
+                     (+ view-start-x i) (num->pixel/left left-min)))))
+         #f)])))
 
 ;; max-from : (nat -> number) nat -> number
 ;; find the largest absolute value among the samples in [0,limit)
@@ -218,8 +264,10 @@
       (define y-val 
         (cond [(< scaled-x len)
                (format-sample
-                (if (> y (/ (get-height) 2))
-                    (right-getter scaled-x)
+                (if right-getter
+                    (if (> y (/ (get-height) 2))
+                        (right-getter scaled-x)
+                        (left-getter scaled-x))
                     (left-getter scaled-x)))]
               [else "undefined"]))
       (define frame-num-str
@@ -272,10 +320,12 @@
                 frame)]
          [tx (new text%)]
          [ty (new text%)]
+         [paint-callback (if right-getter
+                             (make-sound-drawing-callback left-getter right-getter len common-scale?)
+                             (make-sound-mono-drawing-callback left-getter len common-scale?))]
          [c (new sound-canvas%
                  [parent f]
-                 [paint-callback 
-                  (make-sound-drawing-callback left-getter right-getter len common-scale?)]
+                 [paint-callback paint-callback]
                  [len len]
                  [frame-num-text tx]
                  [y-value-text   ty]
@@ -283,8 +333,9 @@
                  [right-getter right-getter]
                  [style '(hscroll)]
                  [frames-per-pixel (/ len width)])]
+         [info-panel (new horizontal-panel% [parent frame])]
          [ecx (new editor-canvas%
-                   [parent f]
+                   [parent info-panel]
                    [editor tx]
                    [style '(no-border no-hscroll no-vscroll)]
                    [stretchable-width #t]
@@ -294,7 +345,7 @@
                    [min-width 50]
                    [min-height 20])]
          [ecy (new editor-canvas%
-                   [parent f]
+                   [parent info-panel]
                    [editor ty]
                    [style '(no-border no-hscroll no-vscroll)]
                    [stretchable-width #t]
@@ -383,7 +434,7 @@
                  #:width [width 800] #:height [height 230])
   (vector-display-frame parent title
                 (lambda (i) (/ (rs-ith/left/s16 sound i) s16max))
-                (lambda (i) (/ (rs-ith/right/s16 sound i) s16max))
+                #f
                 (rs-frames sound)
                 width
                 height
